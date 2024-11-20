@@ -2,3 +2,8 @@ Log 20/11-2024:
 
 - Zotero
 - GitHub
+- Project Timeline draft
+- Overleaf project
+- Reading and taking notes on:
+	- Infant FreeSurfer: An automated segmentation and surface extraction pipeline for T1-weighted neuroimaging data of infants 0–2 years
+	- VINNA for neonates: Orientation independence through latent augmentations

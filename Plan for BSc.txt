@@ -1,0 +1,17 @@
+Plan for BSc:
+
+
+Blok 2
+Our main project goal is to gauge different means of assessing brain develop-
+ment and motor function in infants. This will involve a comprehensive literature
+search to identify open data sets, such as the BOBS Repository, to evaluate
+existing methods and state-of-the-art techniques of infant brain segmentation,
+followed by a comparative analysis of these methods. The results of this initial
+analysis will form the basis of developing a prototype framework for segmenting
+the first images acquired through the NIBS-CP study.
+
+Blok 3
+Furthermore we wish to explore the possibilities of improving the existing meth-
+ods for segmentation of baby brains. Achieving this entails the employment of
+advanced image analysis methods in an attempt to beat the benchmark perfor-
+mance that has been established using existing techniques.

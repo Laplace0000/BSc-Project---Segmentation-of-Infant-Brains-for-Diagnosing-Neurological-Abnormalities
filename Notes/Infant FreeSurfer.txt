@@ -1,0 +1,9 @@
+Infant FreeSurfer:
+
+0-2 years
+Myelination causes contrast intensity reversal
+
+Atlas - MRI volume and manual labels of one member
+probabilistic atlas - average volume and corresponding label probabilities. FreeSurfer uses both.
+
+
