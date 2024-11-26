@@ -6,4 +6,40 @@ Myelination causes contrast intensity reversal
 Atlas - MRI volume and manual labels of one member
 probabilistic atlas - average volume and corresponding label probabilities. FreeSurfer uses both.
 
+T1 weighted input -> intensity normalization -> skullstripping -> volumetric segmentation
+-> white matter segmentation -> surface extraction
 
+Existing postnatal infant segmentation tools are restricted to newborns.
+Discrete age points (0, 3, 6, 9, 12 months) or 2 years.
+T1 is preferable as they are acquired at all age groups
+T2 has poor contrast
+
+Labels: cerebral cortex, cerebral white matter, deep gray matter, hippocampus, amygdala, cerebellum and brainstem (Appendix 4)
+
+Proposed automated segmentation and surface extraction pipeline to accommodate T1 weighted MRIs from 0-2 year-olds
+-> segmentations of cortical and subcortical areas of brain
+Pipeline closely following adult-oriented FreeSurfer reconstruction.
+
+Skullstripping
+Double consensus skullstripping
+Multi-Atlas Skull-Stripping:
+https://www.sciencedirect.com/science/article/pii/S1076633213004182
+BET, BSE, 3dSkullStrip, HWA, ROBEX
+Transforming brain masks from atlas spaces into subject space using registration (DRAMMS) + label fusion tool (STAPLE)
+
+Volumetric segmentation
+Design of multiatlas label fusion seg-fw
+An MRI-contrast adaptive version of Bayesian multi-atlas algorithm
+Relies on generative model and uses Bayesian inference -> most likely segmentation.
+N candidate maps made from registered atlases. Each segmentation is L(x) is assumed a sample of a logOdds model defined on the dist(trans(L_{M(x)}))
+Given L of test, intensities I are assumed independent Gaussian distributions with label-dependent-parameters  corrupted by multiplicative (non-neg and smooth) bias field
+This created the base for a Bayesian inference problem given image I and registered segmentations L_n -> find most likely segmentation L
+
+Key difference is some atlasses with insufficient contrast (gray-white) is (set to 0) in M(x) over white matter and cerebral cortex regions.
+This allows a larger not uniform training set. The algorithm does not assume already-seen intensity distributions in new subjects. Instead exploits consistency of voxel intensities within regions and labels.
+IMPORTANT in 0-2 years because of myelination
+
+Training set (26) manually segmented T1-weighted almost uniformly distributed in age ROI ex newborn.
+For multiatlas approach DRAMMS tool is used again (reasoned with robust and accurate performance in the presence of image background noise, FOV differences, image appearance differences and atlas-to-subject anatomical and age variations.)
+
+Surface extraction
