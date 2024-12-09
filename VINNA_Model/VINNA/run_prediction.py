@@ -1,0 +1,611 @@
+# Copyright 2023 Image Analysis Lab, German Center for Neurodegenerative Diseases (DZNE), Bonn
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# IMPORTS
+import argparse
+import copy
+import sys
+import os.path as op
+from concurrent.futures import Executor, ThreadPoolExecutor, Future
+from pathlib import Path
+from typing import Any, Iterator, Optional, Sequence, Union, Tuple, Dict
+
+import nibabel as nib
+import numpy as np
+import torch
+import yacs.config
+
+from VINNA.utils import logging, parser_defaults, Plane, PLANES
+import VINNA.data_processing.utils.data_utils as du
+from VINNA.utils.checkpoint import (
+    get_checkpoints,
+    load_checkpoint_config_defaults,
+)
+from VINNA.utils.load_config import load_config
+from VINNA.eval import Inference
+
+from FastSurferCNN.data_loader import conform as conf
+from FastSurferCNN.data_loader.data_utils import load_image, save_image
+from FastSurferCNN.utils.common import (
+    find_device,
+    SubjectList,
+    assert_no_root,
+    handle_cuda_memory_exception,
+    SubjectDirectory,
+    NoParallelExecutor,
+    pipeline,
+)
+
+
+##
+# Global Variables
+##
+from VINNA.utils.parser_defaults import VINNA_ROOT
+
+LOGGER = logging.getLogger(__name__)
+CHECKPOINT_PATHS_FILE = VINNA_ROOT / "VINNA/config/checkpoint_paths.yaml"
+
+
+##
+# Processing
+##
+def set_up_cfgs(cfg: str, args: argparse.Namespace) -> yacs.config.CfgNode:
+    """
+    Set up configuration.
+
+    Sets up configurations with given arguments inside the yaml file.
+
+    Parameters
+    ----------
+    cfg : str
+        Path to yaml file of configurations.
+    args : argparse.Namespace
+        {out_dir, batch_size} arguments.
+
+    Returns
+    -------
+    yacs.config.CfgNode
+        Node of configurations.
+    """
+    cfg = load_config(cfg)
+    cfg.OUT_LOG_DIR = args.out_dir if args.out_dir is not None else cfg.LOG_DIR
+    cfg.OUT_LOG_NAME = "vinna4neonates"
+    cfg.TEST.BATCH_SIZE = args.batch_size
+    cfg.DATA.IMG_TYPE = "image" if args.mode == "T1" else "t2_image"
+    cfg.DATA.PADDED_SIZE = args.out_dims
+    cfg.MODEL.OUT_TENSOR_WIDTH = cfg.DATA.PADDED_SIZE
+    cfg.MODEL.OUT_TENSOR_HEIGHT = cfg.DATA.PADDED_SIZE
+    return cfg
+
+
+def args2cfg(
+        args: argparse.Namespace,
+) -> Tuple[
+    yacs.config.CfgNode, yacs.config.CfgNode, yacs.config.CfgNode, yacs.config.CfgNode
+]:
+    """
+    Extract the configuration objects from the arguments.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Arguments.
+
+    Returns
+    -------
+     yacs.config.CfgNode
+        Configurations for all planes.
+    """
+    cfg_cor = set_up_cfgs(args.cfg_cor, args) if args.cfg_cor is not None else None
+    cfg_sag = set_up_cfgs(args.cfg_sag, args) if args.cfg_sag is not None else None
+    cfg_ax = set_up_cfgs(args.cfg_ax, args) if args.cfg_ax is not None else None
+    cfg_fin = (
+        cfg_cor if cfg_cor is not None else cfg_sag if cfg_sag is not None else cfg_ax
+    )
+    return cfg_fin, cfg_cor, cfg_sag, cfg_ax
+
+
+##
+# Input array preparation
+##
+
+
+class RunModelOnData:
+    """
+    Run the model prediction on given data.
+
+    Attributes
+    ----------
+    pred_name : str
+    conf_name : str
+    orig_name : str
+    vox_size : float, 'min'
+    current_plane : str
+    models : Dict[str, Inference]
+    view_ops : Dict[str, Dict[str, Any]]
+    conform_to_1mm_threshold : float, optional
+        threshold until which the image will be conformed to 1mm res
+
+    Methods
+    -------
+    __init__()
+        Construct object.
+    set_and_create_outdir()
+        Sets and creates output directory.
+    conform_and_save_orig()
+        Saves original image.
+    set_subject()
+        Setter.
+    get_subject_name()
+        Getter.
+    set_model()
+        Setter.
+    run_model()
+        Calculates prediction.
+    get_img()
+        Getter.
+    save_img()
+        Saves image as file.
+    set_up_model_params()
+        Setter.
+    get_num_classes()
+        Getter.
+    """
+
+    pred_name: str
+    conf_name: str
+    orig_name: str
+    vox_size: Union[float, "min"]
+    current_plane: str
+    models: Dict[str, Inference]
+    view_ops: Dict[str, Dict[str, Any]]
+    conform_to_1mm_threshold: Optional[float]
+    _pool: Executor
+
+    def __init__(self, args: argparse.Namespace):
+        """
+        Construct RunModelOnData object.
+
+        Parameters
+        ----------
+        args : argparse.Namespace
+            pred_name : str
+            conf_name : str
+            orig_name : str
+            remove_suffix : [MISSING]
+            sf : float
+                Defaults to 1.0.
+            out_dir : str
+                Directory of output.
+            viewagg_device : str
+                Device to run viewagg on. Can be auto, cuda or cpu.
+        """
+        self.pred_name = args.pred_name
+        self.conf_name = args.conf_name
+        self.orig_name = args.orig_name
+        self._threads = getattr(args, "threads", 1)
+        torch.set_num_threads(self._threads)
+        self._async_io = getattr(args, "async_io", False)
+
+        self.sf = 1.0
+
+        device = find_device(args.device)
+
+        if device.type == "cpu" and args.viewagg_device == "auto":
+            self.viewagg_device = device
+        else:
+            # check, if GPU is big enough to run view agg on it
+            # (this currently takes the memory of the passed device)
+            self.viewagg_device = torch.device(
+                find_device(
+                    args.viewagg_device,
+                    flag_name="viewagg_device",
+                    min_memory=4 * (2 ** 30),
+                )
+            )
+
+        LOGGER.info(f"Running view aggregation on {self.viewagg_device}")
+
+        try:
+            LOGGER.error(f"LUT-File {args.lut}")
+            self.lut = du.read_classes_from_lut(args.lut)
+        except FileNotFoundError:
+            raise ValueError(
+                f"Could not find the ColorLUT in {args.lut}, please make sure the "
+                f"--lut argument is valid."
+            )
+        self.labels = self.lut["ID"].values
+        self.torch_labels = torch.from_numpy(self.lut["ID"].values)
+        self.names = ["SubjectName", "Average", "Subcortical", "Cortical"]
+        self.cfg_fin, cfg_cor, cfg_sag, cfg_ax = args2cfg(args)
+        # the order in this dictionary dictates the order in the view aggregation
+        self.view_ops = {
+            "coronal": {"cfg": cfg_cor,
+                        "ckpt": args.ckpt_cor_t1 if args.mode == "T1" else args.ckpt_cor_t2},
+            "sagittal": {"cfg": cfg_sag,
+                         "ckpt": args.ckpt_sag_t1 if args.mode == "T1" else args.ckpt_sag_t2},
+            "axial": {"cfg": cfg_ax,
+                      "ckpt": args.ckpt_ax_t1 if args.mode == "T1" else args.ckpt_ax_t2},
+        }
+        self.num_classes = max(
+            view["cfg"].MODEL.NUM_CLASSES for view in self.view_ops.values()
+        )
+        self.models = {}
+        for plane, view in self.view_ops.items():
+            if view["cfg"] is not None and view["ckpt"] is not None:
+                self.models[plane] = Inference(
+                    view["cfg"], ckpt=view["ckpt"], device=device, lut=self.lut,
+                )
+
+        vox_size = args.vox_size
+        if vox_size == "min":
+            self.vox_size = "min"
+        elif 0.0 < float(vox_size) <= 1.0:
+            self.vox_size = float(vox_size)
+        else:
+            raise ValueError(
+                f"Invalid value for vox_size, must be between 0 and 1 or 'min', was "
+                f"{vox_size}."
+            )
+        self.conform_to_1mm_threshold = args.conform_to_1mm_threshold
+
+    @property
+    def pool(self) -> Executor:
+        if not hasattr(self, "_pool"):
+            if not self._async_io:
+                self._pool = NoParallelExecutor()
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._pool = ThreadPoolExecutor(self._threads)
+        return self._pool
+
+    def __del__(self):
+        if hasattr(self, "_pool"):
+            # only wait on futures, if we specifically ask (see end of the script, so we do not wait if we encounter a
+            # fail case)
+            self._pool.shutdown(True)
+
+    def conform_and_save_orig(
+            self, subject: SubjectDirectory, args
+    ) -> Tuple[nib.analyze.SpatialImage, np.ndarray]:
+        """
+        Conform and saves original image.
+
+        Parameters
+        ----------
+        subject : SubjectDirectory
+            Subject directory object.
+
+        Returns
+        -------
+        Tuple[nib.analyze.SpatialImage, np.ndarray]
+            Conformed image.
+        """
+        orig, orig_data = load_image(subject.orig_name, "orig image")
+        LOGGER.info(f"Successfully loaded image from {subject.orig_name}.")
+
+        # Save input image to standard location, but only
+        if subject.can_resolve_attribute("copy_orig_name"):
+            self.pool.submit(self.save_img, subject.copy_orig_name, orig_data, orig)
+
+        if not conf.is_conform(
+                orig,
+                conform_vox_size=self.vox_size,
+                check_dtype=True,
+                verbose=True,
+                conform_to_1mm_threshold=self.conform_to_1mm_threshold,
+        ):
+            LOGGER.info("Conforming image")
+            orig = conf.conform(
+                orig,
+                conform_vox_size=self.vox_size,
+                conform_to_1mm_threshold=self.conform_to_1mm_threshold,
+            )
+            orig_data = np.asanyarray(orig.dataobj)
+
+        # Save conformed input image
+        # Error with SubjectList in v2.2.0 of FastSurfer --> doubles directories
+        # for conf_name and pred_name
+        if op.join(args.out_dir, args.sid) in args.conf_name:
+            conf_name = args.conf_name
+        else:
+            conf_name = subject.conf_name
+        if subject.can_resolve_attribute("conf_name"):
+            self.pool.submit(
+                self.save_img, conf_name, orig_data, orig, dtype=np.uint8
+            )
+        else:
+            raise RuntimeError(
+                "Cannot resolve the name to the conformed image, please specify an "
+                "absolute path."
+            )
+
+        return orig, orig_data
+
+    def set_model(self, plane: Plane):
+        """
+        Set the current model for the specified plane.
+
+        Parameters
+        ----------
+        plane : Plane
+            The plane for which to set the current model.
+        """
+        self.current_plane = plane
+
+    def get_prediction(
+            self, image_name: str, orig_data: np.ndarray, zoom: Union[np.ndarray, Sequence[int]],
+    ) -> np.ndarray:
+        """
+        Run and get prediction.
+
+        Parameters
+        ----------
+        image_name : str
+            Original image filename.
+        orig_data : np.ndarray
+            Original image data.
+        zoom : np.ndarray, tuple
+            Original zoom.
+
+        Returns
+        -------
+        np.ndarray
+            Predicted classes.
+        """
+        shape = orig_data.shape + (self.get_num_classes(),)
+        kwargs = {
+            "device": self.viewagg_device,
+            "dtype": torch.float16,
+            "requires_grad": False,
+        }
+
+        pred_prob = torch.zeros(shape, **kwargs)
+
+        # inference and view aggregation
+        for plane, model in self.models.items():
+            LOGGER.info(f"Run {plane} prediction")
+            self.set_model(plane)
+            # pred_prob is updated inplace to conserve memory
+            pred_prob = model.run(image_name, orig_data, zoom, out=pred_prob)
+
+        # Get hard predictions
+        pred_classes = torch.argmax(pred_prob, 3)
+        del pred_prob
+        # map to freesurfer label space
+        pred_classes = du.map_label2aparc_aseg(pred_classes.cpu(), self.torch_labels)
+        # return numpy array
+        return pred_classes
+
+    def save_img(
+            self,
+            save_as: Union[str, Path],
+            data: Union[np.ndarray, torch.Tensor],
+            orig: nib.analyze.SpatialImage,
+            dtype: Optional[type] = None,
+    ) -> None:
+        """
+        Save image as a file.
+
+        Parameters
+        ----------
+        save_as : str, Path
+            Filename to give the image.
+        data : np.ndarray, torch.Tensor
+            Image data.
+        orig : nib.analyze.SpatialImage
+            Original Image.
+        dtype : type, optional
+            Data type to use for saving the image. If None, the original data type is
+            used (Default value = None).
+        """
+        save_as = Path(save_as)
+        # Create output directory if it does not already exist.
+        if not save_as.parent.exists():
+            LOGGER.info(
+                f"Output image directory {save_as.parent} does not exist. "
+                f"Creating it now..."
+            )
+            save_as.parent.mkdir(parents=True)
+
+        np_data = data if isinstance(data, np.ndarray) else data.cpu().numpy()
+        if dtype is not None:
+            _header = orig.header.copy()
+            _header.set_data_dtype(dtype)
+        else:
+            _header = orig.header
+        du.save_image_as_nifti(_header, orig.affine, np_data, str(save_as), dtype_set=dtype)
+
+        LOGGER.info(
+            f"Successfully saved image {'asynchronously ' if self._async_io else ''}  as {save_as}."
+        )
+
+    def async_save_img(
+        self,
+        save_as: str,
+        data: Union[np.ndarray, torch.Tensor],
+        orig: nib.analyze.SpatialImage,
+        dtype: Union[None, type] = None,
+    ):
+        """Saves the image asynchronously and returns a concurrent.futures.Future to track, when this finished."""
+        return self.pool.submit(self.save_img, save_as, data, orig, dtype)
+
+    def set_up_model_params(
+            self,
+            plane: Plane,
+            cfg: "yacs.config.CfgNode",
+            ckpt: "torch.Tensor",
+    ) -> None:
+        """
+        Set up the model parameters from the configuration and checkpoint.
+        """
+        self.view_ops[plane]["cfg"] = cfg
+        self.view_ops[plane]["ckpt"] = ckpt
+
+    def get_num_classes(self) -> int:
+        """
+        Return the number of classes.
+
+        Returns
+        -------
+        int
+            The number of classes.
+        """
+        return self.num_classes
+
+    def pipeline_conform_and_save_orig(
+            self, subjects: SubjectList, args
+    ) -> Iterator[Tuple[SubjectDirectory, Tuple[nib.analyze.SpatialImage, np.ndarray]]]:
+        """
+        Pipeline for conforming and saving original images asynchronously.
+
+        Parameters
+        ----------
+        subjects : SubjectList
+            List of subjects to process.
+
+        Yields
+        ------
+        Tuple[SubjectDirectory, Tuple[nib.analyze.SpatialImage, np.ndarray]]
+            Subject directory and a tuple with the image and its data.
+        """
+        if not self._async_io:
+            # do not pipeline, direct iteration and function call
+            for subject in subjects:
+                # yield subject and load orig
+                yield subject, self.conform_and_save_orig(subject, args)
+        else:
+            # pipeline the same
+            for data in pipeline(self.pool, self.conform_and_save_orig, subjects):
+                yield data
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run inference")
+
+    # 1. Options for input directories and filenames
+    parser = parser_defaults.add_arguments(
+        parser, ["tw", "mode", "sid", "in_dir", "out_dims", "csv_file", "tag",
+                 "lut", "remove_suffix"]
+    )
+
+    # 2. Options for output
+    parser = parser_defaults.add_arguments(
+        parser,
+        [
+            "segfile",
+            "conformed_name",
+            "sd",
+            "seg_log",
+        ],
+    )
+
+    # 3. Checkpoints to load
+    files: Dict[Plane, Union[str, Path]] = {k: "default" for k in PLANES}
+    parser = parser_defaults.add_plane_flags(
+        parser,
+        "checkpoint_t1",
+        files,
+        CHECKPOINT_PATHS_FILE
+    )
+
+    parser = parser_defaults.add_plane_flags(
+        parser,
+        "checkpoint_t2",
+        files,
+        CHECKPOINT_PATHS_FILE
+    )
+
+    # 4. CFG-file with default options for network
+    parser = parser_defaults.add_plane_flags(
+        parser,
+        "config",
+        files,
+        CHECKPOINT_PATHS_FILE
+    )
+
+    # 5. technical parameters
+    parser = parser_defaults.add_arguments(
+        parser,
+        [
+            "vox_size",
+            "conform_to_1mm_threshold",
+            "device",
+            "viewagg_device",
+            "batch_size",
+            "async_io",
+            "threads",
+            "allow_root",
+        ],
+    )
+
+    args = parser.parse_args()
+    # Warning if run as root user
+    args.allow_root or assert_no_root()
+
+    # Set up logging
+    from VINNA.utils.logging import setup_logging
+
+    setup_logging(args.log_name)
+
+    # Download checkpoints if they do not exist
+    # see utils/checkpoint.py for default paths
+    LOGGER.info("Checking or downloading default checkpoints ...")
+
+    urls = load_checkpoint_config_defaults("url", filename=CHECKPOINT_PATHS_FILE)
+
+    if args.mode == "T1":
+        get_checkpoints(args.ckpt_ax_t1, args.ckpt_cor_t1, args.ckpt_sag_t1, urls=urls)
+    else:
+        get_checkpoints(args.ckpt_ax_t2, args.ckpt_cor_t2, args.ckpt_sag_t2, urls=urls)
+
+    # Set Up Model
+    eval = RunModelOnData(args)
+
+    args.copy_orig_name = "mri/orig/001.mgz"
+    # Get all subjects of interest
+    subjects = SubjectList(args, segfile="pred_name", copy_orig_name="copy_orig_name")
+    subjects.make_subjects_dir()
+
+    iter_subjects = eval.pipeline_conform_and_save_orig(subjects, args)
+    futures = []
+    for subject, (orig_img, data_array) in iter_subjects:
+        # Run model
+        try:
+            # The orig_t1_file is only used to populate verbose messages here
+            pred_data = eval.get_prediction(
+                subject.orig_name, data_array, orig_img.header.get_zooms()
+            )
+            # Error with SubjectList in v2.2.0 of FastSurfer --> doubles directories
+            # for conf_name and pred_name
+            if op.join(args.out_dir, args.sid) in args.pred_name:
+                pred_name = args.pred_name
+            else:
+                pred_name = subject.segfile
+            futures.append(
+                eval.async_save_img(
+                    pred_name, pred_data, orig_img, dtype=np.int16
+                )
+            )
+
+        except RuntimeError as e:
+            if not handle_cuda_memory_exception(e):
+                raise e
+
+    # wait for async processes to finish
+    for f in futures:
+        _ = f.result()
+
+    sys.exit(0)

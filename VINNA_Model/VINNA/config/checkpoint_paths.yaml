@@ -1,0 +1,17 @@
+url:
+- "https://b2share.fz-juelich.de/api/files/feb8ff4b-8e46-47f3-9944-f6a7f7ffd1ba"
+- "https://zenodo.org/records/10933088/files"
+
+checkpoint_t1:
+  axial: "checkpoints/vinna4neonates_axial_t1_v1.0.0.pkl"
+  coronal: "checkpoints/vinna4neonates_coronal_t1_v1.0.0.pkl"
+  sagittal: "checkpoints/vinna4neonates_sagittal_t1_v1.0.0.pkl"
+checkpoint_t2:
+  axial: "checkpoints/vinna4neonates_axial_t2_v1.0.0.pkl"
+  coronal: "checkpoints/vinna4neonates_coronal_t2_v1.0.0.pkl"
+  sagittal: "checkpoints/vinna4neonates_sagittal_t2_v1.0.0.pkl"
+
+config:
+  axial: "VINNA/config/vinna4neonates_axial.yaml"
+  coronal: "VINNA/config/vinna4neonates_coronal.yaml"
+  sagittal: "VINNA/config/vinna4neonates_sagittal.yaml"

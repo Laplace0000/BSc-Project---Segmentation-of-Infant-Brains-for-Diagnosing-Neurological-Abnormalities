@@ -1,0 +1,95 @@
+{
+  "MODEL": {
+    "MODEL_NAME": "FastSurferVINN",
+    "NUM_CLASSES": 89,
+    "LOSS_FUNC": "combined",
+    "NUM_FILTERS": 64,
+    "NUM_FILTERS_INTERPOL": 32,
+    "NUM_BLOCKS": 5,
+    "NUM_CHANNELS": 7,
+    "KERNEL_H": 3,
+    "KERNEL_W": 3,
+    "KERNEL_D": 3,
+    "KERNEL_C": 1,
+    "STRIDE_CONV": 1,
+    "STRIDE_POOL": 2,
+    "POOL": 2,
+    "HEIGHT": 320,
+    "WIDTH": 320,
+    "BASE_RES": 0.8,
+    "INTERPOLATION_MODE": "bilinear",
+    "CROP_POSITION": "top_left",
+    "OUT_TENSOR_WIDTH": 256,
+    "OUT_TENSOR_HEIGHT": 256
+  },
+  "TRAIN": {
+    "BATCH_SIZE": 16,
+    "LOG_INTERVAL": 50,
+    "RESUME": false,
+    "RESUME_EXPR_NUM": "Default",
+    "NUM_EPOCHS": 160,
+    "NUM_STEPS": 10,
+    "FINE_TUNE": false,
+    "CHECKPOINT_PERIOD": 20,
+    "NUM_WORKERS": 3,
+  },
+  "TEST": {
+    "BATCH_SIZE": 16
+  },
+  "DATA": {
+    "PATH_HDF5_TRAIN": "coronal_train.hdf5",
+    "PATH_HDF5_VAL": "coronal_val.hdf5",
+    "PLANE": "coronal",
+    "IMG_TYPE": "image",
+    "LUT": "VINNA4neonates_full_LUT.tsv",
+    "COMBINED_LABELS": true,
+    "SIZES": [
+      "256"
+    ],
+    "PADDED_SIZE": 256,
+    "AUG": [
+      "RAnisotropy",
+      "BiasField",
+      "RGamma",
+      "Noise",
+      "Ghosting",
+      "Blur",
+      "Gaussian"
+    ],
+    "LATENT_AFFINE": true,
+    "Rot_ANGLE_MIN": 0,
+    "Rot_ANGLE_MAX": 180,
+    "TRANSLATION_MIN": 0.2,
+    "TRANSLATION_MAX": 0.4,
+    "DIMENSION": 2
+  },
+  "DATA_LOADER": {
+    "NUM_WORKERS": 3,
+    "PIN_MEMORY": true
+  },
+  "OPTIMIZER": {
+    "BASE_LR": 0.01,
+    "LR_SCHEDULER": "cosineWarmRestarts",
+    "GAMMA": 0.3,
+    "STEP_SIZE": 5,
+    "ETA_MIN": 0.0001,
+    "T_ZERO": 10,
+    "T_MULT": 2,
+    "FACTOR": 0.1,
+    "PATIENCE": 5,
+    "THRESH": 0.0001,
+    "COOLDOWN": 0,
+    "MODE": "min",
+    "MOMENTUM": 0.9,
+    "DAMPENING": 0.0,
+    "NESTEROV": true,
+    "WEIGHT_DECAY": 0.0001,
+    "OPTIMIZING_METHOD": "adamW"
+  },
+  "NUM_GPUS": 1,
+  "LOG_DIR": "VINNA4neonates",
+  "EXPR_NUM": "VINNA4neonates_coronal",
+  "RNG_SEED": 1,
+  "SUMMARY_PATH": "VINNA4neonates/summary/VINNA4neonates_coronal",
+  "CONFIG_LOG_PATH": "VINNA4neonates/config/VINNA4neonates_coronal"
+}
